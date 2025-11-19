@@ -727,26 +727,34 @@ class BankConnector(Document):
 			)
 
 
-def get_bank_connector(bank_account, company):
+def get_bank_connector(bank_account, company, is_bulk=False):
 	# Fetch the connector information
-	bank_connector = frappe.db.exists(
-		"Bank Connector",
-		{
-			"company": company,
-			"bank_account": bank_account,
-		},
-	)
+	filters = {
+		"company": company,
+		"bank_account": bank_account,
+	}
+	
+	# If is_bulk is True, only get connectors with bulk_transaction enabled
+	if is_bulk:
+		filters["bulk_transaction"] = 1
+	
+	bank_connector = frappe.db.exists("Bank Connector", filters)
+	
 	if not bank_connector:
-		frappe.throw(_("Bank Connector is not initialized"))
+		if is_bulk:
+			frappe.throw(_("Bank Connector with bulk transaction enabled is not initialized for this bank account"))
+		else:
+			frappe.throw(_("Bank Connector is not initialized"))
 
 	return frappe.get_doc("Bank Connector", bank_connector)
 
 
 @frappe.whitelist()
-def make_payment(payment_order, otp=None):
+def make_payment(payment_order, otp=None, is_bulk=0):
 	payment_order = frappe.get_doc("Payment Order", payment_order)
+	is_bulk = cint(is_bulk) or (payment_order.get("is_bulk") or 0)
 	bank_connector = get_bank_connector(
-		payment_order.company_bank_account, payment_order.company
+		payment_order.company_bank_account, payment_order.company, is_bulk=is_bulk
 	)
 	return bank_connector.make_post_request(
 		payment_order, otp=otp, action="initiate_payment"

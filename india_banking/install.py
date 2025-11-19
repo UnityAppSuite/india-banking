@@ -296,6 +296,13 @@ def create_payment_order_custom_fields():
 				"insert_after": "posting_date",
 			},
 			{
+				"label": "Is Bulk Payment",
+				"fieldname": "is_bulk",
+				"fieldtype": "Check",
+				"default": 0,
+				"insert_after": "status",
+			},
+			{
 				"label": "Enqueue Status",
 				"fieldname": "enqueue_status",
 				"fieldtype": "Select",
