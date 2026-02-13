@@ -75,6 +75,7 @@
    "depends_on": "eval: doc.bank == \"ICICI Bank\"",
    "fieldname": "bulk_transaction",
    "fieldtype": "Check",
+   "hidden": 1,
    "label": "Bulk Transaction"
   }
  ],

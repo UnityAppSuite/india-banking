@@ -355,6 +355,7 @@ class BankConnector(Document):
 			frappe.throw("Invalid Request")
 
 	def make_single_request(self, payment_order, summary):
+		self.bulk_transaction = 0  # Single request is always non-bulk
 		url = self.connector_url
 		headers = self.headers
 
@@ -703,14 +704,40 @@ def get_bank_connector(bank_account, company):
 
 
 @frappe.whitelist()
-def make_payment(payment_order, otp=None):
+def make_payment(payment_order, otp=None, bulk_transaction=None):
 	payment_order = frappe.get_doc("Payment Order", payment_order)
 	bank_connector = get_bank_connector(
 		payment_order.company_bank_account, payment_order.company
 	)
+	if bulk_transaction is not None:
+		bank_connector.bulk_transaction = cint(bulk_transaction)
+
+	validate_connector_record(payment_order, bank_connector)
+
 	return bank_connector.make_post_request(
 		payment_order, otp=otp, action="initiate_payment"
 	)
+
+
+def validate_connector_record(payment_order, bank_connector):
+	"""Validate that a matching connector record exists on the connector server for the selected payment mode."""
+	bank_account = frappe.get_doc("Bank Account", payment_order.company_bank_account)
+	mode = "Bulk Transaction" if bank_connector.bulk_transaction else "Single Payment"
+
+	settings = frappe.get_single("Connector Settings")
+	connector_doctype = settings.get_bank_connector(
+		bank_account.bank, integration_mode=bank_connector.get("integration_mode")
+	)
+
+	connector_filter = {"account_number": bank_account.bank_account_no}
+	if frappe.get_meta(connector_doctype).has_field("bulk_transaction"):
+		connector_filter["bulk_transaction"] = cint(bank_connector.bulk_transaction)
+
+	if not frappe.db.exists(connector_doctype, connector_filter):
+		msg = _(f"No {mode} connector record found for account {bank_account.bank_account_no}. "
+			f"Please create a {connector_doctype} record with Bulk Transaction {'checked' if bank_connector.bulk_transaction else 'unchecked'} for this account.")
+		frappe.log_error("Connector Record Not Found", msg)
+		frappe.throw(msg, title=_("Connector Record Not Found"))
 
 
 @frappe.whitelist()
@@ -719,6 +746,8 @@ def get_payment_status(payment_order):
 	bank_connector = get_bank_connector(
 		payment_order.company_bank_account, payment_order.company
 	)
+	bank_connector.bulk_transaction = 1 if payment_order.file_sequence_number else 0
+
 	return bank_connector.make_post_request(payment_order, action="get_payment_status")
 
 

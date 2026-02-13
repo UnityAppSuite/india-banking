@@ -286,24 +286,40 @@ frappe.ui.form.on("Payment Order", {
 	},
 
 	make_payment: function (frm) {
-		frappe.call({
-			method:
-				"india_banking.india_banking.doctype.bank_connector.bank_connector.make_payment",
-			freeze: true,
-			freeze_message: __("Initiating Payment..."),
-			args: {
-				payment_order: frm.doc.name,
+		frappe.prompt(
+			{
+				label: __("Payment Mode"),
+				fieldname: "payment_mode",
+				fieldtype: "Select",
+				options: "Single Payment\nBulk Transaction",
+				default: "Single Payment",
+				reqd: true,
 			},
-			callback: (res) => {
-				if (res.message && res.message.otp_required) {
-					// If OTP is required, trigger OTP verification
-					frm.trigger("verify_otp");
-				}
+			(values) => {
+				frm._bulk_transaction = values.payment_mode === "Bulk Transaction" ? 1 : 0;
+				frappe.call({
+					method:
+						"india_banking.india_banking.doctype.bank_connector.bank_connector.make_payment",
+					freeze: true,
+					freeze_message: __("Initiating Payment..."),
+					args: {
+						payment_order: frm.doc.name,
+						bulk_transaction: frm._bulk_transaction,
+					},
+					callback: (res) => {
+						if (res.message && res.message.otp_required) {
+							// If OTP is required, trigger OTP verification
+							frm.trigger("verify_otp");
+						}
 
-				// Reload the form to reflect any changes (whether OTP is required or not)
-				frm.reload_doc();
+						// Reload the form to reflect any changes (whether OTP is required or not)
+						frm.reload_doc();
+					},
+				});
 			},
-		});
+			__("Select Payment Mode"),
+			__("Proceed")
+		);
 	},
 
 	verify_otp(frm) {
@@ -335,6 +351,7 @@ frappe.ui.form.on("Payment Order", {
 					args: {
 						payment_order: frm.doc.name,
 						otp: otp,
+						bulk_transaction: frm._bulk_transaction,
 					},
 					callback: function (r) {
 						if (!r.exc) {
