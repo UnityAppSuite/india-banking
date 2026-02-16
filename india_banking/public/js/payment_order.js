@@ -293,6 +293,7 @@ frappe.ui.form.on("Payment Order", {
 			freeze_message: __("Initiating Payment..."),
 			args: {
 				payment_order: frm.doc.name,
+				is_bulk: frm.doc.is_bulk || 0,
 			},
 			callback: (res) => {
 				if (res.message && res.message.otp_required) {
@@ -335,6 +336,7 @@ frappe.ui.form.on("Payment Order", {
 					args: {
 						payment_order: frm.doc.name,
 						otp: otp,
+						is_bulk: frm.doc.is_bulk || 0,
 					},
 					callback: function (r) {
 						if (!r.exc) {
