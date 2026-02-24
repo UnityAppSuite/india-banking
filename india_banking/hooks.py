@@ -12,6 +12,8 @@ before_uninstall = "india_banking.uninstall.before_uninstall"
 
 doctype_js = {
 	"Payment Order": "public/js/payment_order.js",
+	"Payroll Entry": "public/js/payroll_entry.js",
+	"Journal Entry": "public/js/journal_entry.js",
 	"Purchase Invoice": "public/js/purchase_invoice.js",
 	"Bank Account": "public/js/bank_account.js",
 	"Payment Request": "public/js/payment_request.js",
