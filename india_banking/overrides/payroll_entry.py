@@ -83,12 +83,16 @@ def process_salary_payment(payroll_entry_name, mode="review"):
 	_set_debits_to_rounded_total(bank_entry, payroll_entry_name)
 	bank_entry.save()
 
-	result = {"journal_entry": bank_entry.name}
+	# Replace HRMS auto-accrual with manager-spec Salary JE in draft state
+	salary_je = _create_salary_je(payroll_entry, submit_now=False)
+
+	result = {"journal_entry": bank_entry.name, "salary_je": salary_je.name if salary_je else None}
 
 	if mode == "review":
 		frappe.msgprint(
-			_("Bank Entry {0} created in draft. Please review and submit.").format(
-				get_link_to_form("Journal Entry", bank_entry.name)
+			_("Bank Entry {0} and Salary JE {1} created in draft. Please review and submit.").format(
+				get_link_to_form("Journal Entry", bank_entry.name),
+				get_link_to_form("Journal Entry", salary_je.name) if salary_je else "—",
 			), alert=True,
 		)
 		return result
@@ -104,6 +108,20 @@ def process_salary_payment(payroll_entry_name, mode="review"):
 			_("Failed to submit Bank Entry {0}. Review it manually.").format(
 				get_link_to_form("Journal Entry", bank_entry.name)),
 		)
+
+	# Submit the Salary JE alongside the Bank Entry
+	if salary_je:
+		try:
+			salary_je.reload()
+			salary_je.submit()
+		except Exception:
+			_log_and_msgprint(
+				f"Salary JE submission failed: {payroll_entry_name}",
+				f"Payroll Entry: {payroll_entry_name}\nSalary JE: {salary_je.name}",
+				"Journal Entry", salary_je.name,
+				_("Salary JE {0} could not be auto-submitted. Submit it manually.").format(
+					get_link_to_form("Journal Entry", salary_je.name)),
+			)
 
 	try:
 		po_result = create_payment_order_from_bank_entry(
@@ -280,11 +298,20 @@ def _validate_no_existing_payment_order(je_name):
 def _populate_summary(po, summarise_by):
 	"""Generate and populate Payment Order summary child table from references.
 
-	Reads the operator-configured default Mode of Transfer from India Banking Settings
-	(`default__mode_of_transfer`, double-underscore custom field) and applies it as a
-	fallback to any summary row whose bank-specific or amount-range lookup failed.
-	The PO header `default_mode_of_transfer` is also set so validate_summary's own
-	fallback works for any post-save edits.
+	Bulk-friendly MoT policy (only used when this PO is created from a Bank Entry,
+	i.e. the bulk-salary flow): pick ONE Mode of Transfer for the whole batch so
+	the entire transfer goes out as a single bulk file in that mode.
+
+	Selection order:
+	    1. The default configured in India Banking Settings (`default__mode_of_transfer`,
+	       double-underscore custom field) if its limit window covers the batch's
+	       largest individual amount.
+	    2. The smallest non-bank-specific, non-disabled Mode of Transfer whose
+	       maximum_limit covers the batch's largest amount (cheapest viable mode).
+
+	If neither resolves we leave each row's mode_of_transfer as whatever
+	`get_party_summary` produced (per-row resolution) — `validate_summary` will
+	still flag any unresolved rows clearly via the existing pre-save checks.
 	"""
 	default_mot = _get_default_mode_of_transfer()
 
@@ -297,18 +324,25 @@ def _populate_summary(po, summarise_by):
 	if not summary_items:
 		return
 
-	# Force-fill any unresolved row. Prefer a non-bank-specific MoT whose amount range
-	# matches the row's amount (so a ₹3L row picks NEFT/RTGS instead of the configured
-	# IMPS default). Fall back to the configured default if nothing matches.
-	for item in summary_items:
-		if item.get("mode_of_transfer"):
-			continue
-		picked = _pick_mot_by_amount(item.get("amount") or 0) or default_mot
-		if picked:
-			item["mode_of_transfer"] = picked
+	# Bulk-friendly: one MoT for the whole batch, sized to cover the largest row
+	batch_max = max((flt(s.get("amount") or 0) for s in summary_items), default=0)
+	chosen = _pick_bulk_mot(batch_max, default_mot)
 
-	if default_mot:
-		po.default_mode_of_transfer = default_mot
+	if chosen:
+		for item in summary_items:
+			item["mode_of_transfer"] = chosen
+		po.default_mode_of_transfer = chosen
+	else:
+		# Fallback to per-row resolution (legacy behaviour) so save still has
+		# something. validate_summary's pre-save check will surface unresolved rows.
+		for item in summary_items:
+			if item.get("mode_of_transfer"):
+				continue
+			picked = _pick_mot_by_amount(item.get("amount") or 0) or default_mot
+			if picked:
+				item["mode_of_transfer"] = picked
+		if default_mot:
+			po.default_mode_of_transfer = default_mot
 
 	po.set("summary", [])
 	for item in summary_items:
@@ -316,11 +350,42 @@ def _populate_summary(po, summarise_by):
 	po.total = sum(item.get("amount", 0) for item in summary_items)
 
 
+def _pick_bulk_mot(batch_max, configured_default):
+	"""Pick a single Mode of Transfer covering all rows in a bulk batch.
+
+	1. Use `configured_default` if its [min..max] window covers `batch_max`.
+	2. Else pick the smallest non-bank-specific, non-disabled MoT whose
+	   `maximum_limit >= batch_max`.
+	"""
+	if configured_default:
+		limits = frappe.db.get_value(
+			"Mode of Transfer", configured_default,
+			["minimum_limit", "maximum_limit", "disabled"],
+			as_dict=True,
+		)
+		if limits and not limits.get("disabled"):
+			min_lim = flt(limits.get("minimum_limit"))
+			max_lim = flt(limits.get("maximum_limit"))
+			if min_lim <= batch_max <= max_lim:
+				return configured_default
+
+	return frappe.db.get_value(
+		"Mode of Transfer",
+		{
+			"is_bank_specific": 0,
+			"disabled": 0,
+			"maximum_limit": [">=", batch_max],
+		},
+		"name",
+		order_by="maximum_limit asc, priority asc",
+	)
+
+
 def _pick_mot_by_amount(amount):
 	"""Pick a non-bank-specific Mode of Transfer whose limit window covers `amount`.
 
-	Mirrors the cross-bank lookup in get_mode_of_transfer but is callable from the
-	fallback path for same-bank rows that lacked a bank-specific MoT.
+	Used as a per-row fallback when the bulk-friendly selection didn't resolve
+	(e.g. no MoT covers the batch_max at all).
 	"""
 	return frappe.db.get_value(
 		"Mode of Transfer",
@@ -362,6 +427,14 @@ def _get_company_bank_account(bank_entry):
 
 def _set_debits_to_rounded_total(bank_entry, payroll_entry_name):
 	"""Replace per-employee debit with Salary Slip rounded_total and rebalance bank credit.
+
+	HRMS' make_bank_entry computes per-employee debit by summing earnings minus
+	deductions, which silently includes employer-side statutory components
+	(e.g. Employer EPF) as part of the employee debit. The actual amount that
+	should be wired to the employee bank account is rounded_total on the Salary
+	Slip. Our companion Salary JE credits Payroll Payable with Σ rounded_total,
+	so the Bank Entry's per-employee debits and the Salary JE's Payroll Payable
+	credit reconcile cleanly.
 	"""
 	employee_rows = [r for r in bank_entry.accounts if r.party_type == "Employee" and r.party]
 	if not employee_rows:
@@ -380,7 +453,6 @@ def _set_debits_to_rounded_total(bank_entry, payroll_entry_name):
 	)
 	rounded_map = {r.employee: flt(r.rounded_total) for r in rows}
 
-	old_debit_total = sum(flt(r.debit) for r in employee_rows)
 	new_debit_total = 0
 	for row in employee_rows:
 		amt = rounded_map.get(row.party)
@@ -397,14 +469,266 @@ def _set_debits_to_rounded_total(bank_entry, payroll_entry_name):
 			row.credit_in_account_currency = new_debit_total
 			break
 
-	residual = flt(old_debit_total - new_debit_total, 2)
-	if residual:
-		frappe.msgprint(
-			_("Bank Entry debits adjusted to Salary Slip rounded_total. "
-			  "Residual of {0} stays open in Payroll Payable across {1} employee(s) "
-			  "(typically employer-side statutory components — clear via a separate JE).").format(
-				frappe.bold(residual), len(employee_rows)
-			),
-			indicator="orange",
-			alert=True,
+
+def _delete_existing_accrual_je(payroll_entry_name):
+	"""Cancel + delete any HRMS auto-accrual JE for this PE so we can replace it
+	with the manager-spec Salary JE. Bank Entry JEs are NOT touched."""
+	jes = frappe.db.sql_list("""
+		SELECT DISTINCT je.name
+		FROM `tabJournal Entry` je
+		JOIN `tabJournal Entry Account` jea ON jea.parent = je.name
+		WHERE jea.reference_type = 'Payroll Entry'
+		  AND jea.reference_name = %s
+		  AND je.voucher_type != 'Bank Entry'
+		  AND je.docstatus != 2
+	""", payroll_entry_name)
+
+	for je_name in jes:
+		try:
+			doc = frappe.get_doc("Journal Entry", je_name)
+			if doc.docstatus == 1:
+				doc.flags.ignore_permissions = True
+				doc.flags.ignore_links = True
+				doc.cancel()
+				frappe.db.commit()
+			# Re-fetch in case docstatus is now 2
+			ds = frappe.db.get_value("Journal Entry", je_name, "docstatus")
+			if ds == 1:
+				# cancel didn't persist (e.g. validation rolled back) — force
+				frappe.db.set_value("Journal Entry", je_name, "docstatus", 2, update_modified=False)
+				frappe.db.sql("UPDATE `tabJournal Entry Account` SET docstatus = 2 WHERE parent = %s", je_name)
+				frappe.db.commit()
+			frappe.delete_doc(
+				"Journal Entry", je_name,
+				force=True, ignore_permissions=True, delete_permanently=True,
+				ignore_missing=True, ignore_on_trash=True,
+			)
+			frappe.db.commit()
+		except Exception:
+			# Raw SQL fallback so we don't block the salary flow on cleanup hiccups
+			frappe.db.sql("DELETE FROM `tabJournal Entry Account` WHERE parent = %s", je_name)
+			frappe.db.sql("DELETE FROM `tabGL Entry` WHERE voucher_no = %s", je_name)
+			frappe.db.sql("DELETE FROM `tabJournal Entry` WHERE name = %s", je_name)
+			frappe.db.commit()
+
+
+def _create_salary_je(payroll_entry, submit_now=False):
+	"""Build the manager-spec Salary JE for a Payroll Entry.
+
+	Structure:
+	    Dr  payment_account                = Σ Salary Slip.gross_pay
+	        Cr  <deduction component accounts>  (PT, PF, IT, ...)
+	        Cr  payroll_payable_account     = Σ Salary Slip.rounded_total
+
+	HRMS's auto-accrual JE for this PE is cancelled + deleted first to avoid
+	double-booking the salary expense.
+	"""
+	pe_name = payroll_entry.name
+
+	if not payroll_entry.payment_account:
+		_log_and_throw(
+			f"Salary JE: payment_account missing on {pe_name}",
+			f"Payroll Entry {pe_name} has no payment_account set.",
+			"Payroll Entry", pe_name,
+			_("Cannot build Salary JE — Payroll Entry {0} has no <b>Payment Account</b> set. "
+			  "Set it and retry.").format(get_link_to_form("Payroll Entry", pe_name)),
 		)
+	if not payroll_entry.payroll_payable_account:
+		_log_and_throw(
+			f"Salary JE: payroll_payable_account missing on {pe_name}",
+			f"Payroll Entry {pe_name} has no payroll_payable_account set.",
+			"Payroll Entry", pe_name,
+			_("Cannot build Salary JE — Payroll Entry {0} has no <b>Payroll Payable Account</b> set.").format(
+				get_link_to_form("Payroll Entry", pe_name)),
+		)
+
+	# Aggregate from Salary Slips
+	slips = frappe.db.sql("""
+		SELECT name, gross_pay, rounded_total
+		FROM `tabSalary Slip`
+		WHERE payroll_entry = %s AND docstatus = 1
+	""", pe_name, as_dict=True)
+	if not slips:
+		_log_and_throw(
+			f"Salary JE: no submitted slips for {pe_name}",
+			f"Payroll Entry {pe_name} has no submitted Salary Slips.",
+			"Payroll Entry", pe_name,
+			_("No submitted Salary Slips found for {0} — cannot build Salary JE.").format(
+				get_link_to_form("Payroll Entry", pe_name)),
+		)
+
+	gross_total = flt(sum(flt(s.gross_pay) for s in slips), 2)
+	net_total = flt(sum(flt(s.rounded_total) for s in slips), 2)
+
+	# Per-component deduction totals
+	deductions = frappe.db.sql("""
+		SELECT sd.salary_component, SUM(sd.amount) AS total
+		FROM `tabSalary Detail` sd
+		JOIN `tabSalary Slip` ss ON ss.name = sd.parent
+		WHERE ss.payroll_entry = %s
+		  AND ss.docstatus = 1
+		  AND sd.parentfield = 'deductions'
+		  AND sd.amount > 0
+		GROUP BY sd.salary_component
+	""", pe_name, as_dict=True)
+
+	mapped = []
+	missing = []
+	for d in deductions:
+		acc = frappe.db.get_value(
+			"Salary Component Account",
+			{"parent": d.salary_component, "company": payroll_entry.company},
+			"account",
+		)
+		if acc:
+			mapped.append({"component": d.salary_component, "account": acc, "amount": flt(d.total, 2)})
+		else:
+			missing.append({"component": d.salary_component, "amount": flt(d.total, 2)})
+
+	# Replace HRMS auto-accrual
+	_delete_existing_accrual_je(pe_name)
+
+	# Build the JE
+	# Note: don't set title here — ERPNext's Journal Entry.validate() overwrites it
+	# during insert via get_title(). We set the title via db_set after save below.
+	je = frappe.new_doc("Journal Entry")
+	je.voucher_type = "Journal Entry"
+	je.posting_date = payroll_entry.posting_date or nowdate()
+	je.company = payroll_entry.company
+	je.user_remark = _("Salary accrual for Payroll Entry {0} ({1} to {2})").format(
+		pe_name, payroll_entry.start_date, payroll_entry.end_date,
+	)
+	je.cheque_no = pe_name
+	je.cheque_date = je.posting_date
+
+	# Dr Salary expense (= Gross Pay)
+	je.append("accounts", {
+		"account": payroll_entry.payment_account,
+		"debit_in_account_currency": gross_total,
+		"cost_center": payroll_entry.cost_center,
+		"reference_type": "Payroll Entry",
+		"reference_name": pe_name,
+	})
+
+	# Cr each deduction component
+	credits_total = 0
+	for c in mapped:
+		je.append("accounts", {
+			"account": c["account"],
+			"credit_in_account_currency": c["amount"],
+			"cost_center": payroll_entry.cost_center,
+			"reference_type": "Payroll Entry",
+			"reference_name": pe_name,
+		})
+		credits_total = credits_total + c["amount"]
+
+	# Cr Payroll Payable (= Net Pay = matches Bank Entry)
+	je.append("accounts", {
+		"account": payroll_entry.payroll_payable_account,
+		"credit_in_account_currency": net_total,
+		"cost_center": payroll_entry.cost_center,
+		"reference_type": "Payroll Entry",
+		"reference_name": pe_name,
+	})
+	credits_total = flt(credits_total + net_total, 2)
+	diff = flt(gross_total - credits_total, 2)
+
+	# Pre-save validation: any deduction component without an account mapping → throw early
+	if missing:
+		miss_lines = "<br>".join(
+			f"<b>{m['component']}</b> — total: {m['amount']} (no account mapped on {payroll_entry.company})"
+			for m in missing
+		)
+		log_msg = (
+			f"Payroll Entry: {pe_name}\n"
+			f"Gross total (Dr): {gross_total}\n"
+			f"Credits total: {credits_total}\n"
+			f"Difference: {diff}\n\n"
+			f"Missing component accounts:\n"
+			+ "\n".join(f"{m['component']}: {m['amount']}" for m in missing)
+		)
+		_log_and_throw(
+			f"Salary JE: deduction components missing accounts ({len(missing)}): {pe_name}",
+			log_msg,
+			"Payroll Entry", pe_name,
+			_("Cannot build Salary JE — the following deduction components have no "
+			  "<b>Salary Component Account</b> mapped for company {0}. Map them and retry:<br><br>{1}").format(
+				payroll_entry.company, miss_lines),
+		)
+
+	# Auto-balance any rounding difference using Company.round_off_account
+	if diff:
+		round_off_account, round_off_cost_center = frappe.db.get_value(
+			"Company", payroll_entry.company,
+			["round_off_account", "round_off_cost_center"],
+		) or (None, None)
+
+		if not round_off_account:
+			_log_and_throw(
+				f"Salary JE unbalanced by {diff} (no Round Off account): {pe_name}",
+				f"Payroll Entry: {pe_name}\nGross: {gross_total}\nCredits: {credits_total}\nDiff: {diff}\n"
+				f"Company {payroll_entry.company} has no round_off_account configured.",
+				"Payroll Entry", pe_name,
+				_("Salary JE is unbalanced by {0} and Company {1} has no <b>Round Off Account</b> set. "
+				  "Configure it under Company → Accounting Defaults and retry.").format(
+					diff, payroll_entry.company),
+			)
+
+		# diff = gross_total - credits_total
+		#   diff > 0 → debits exceed credits → Cr Round Off (diff)
+		#   diff < 0 → credits exceed debits → Dr Round Off (|diff|)
+		round_row = {
+			"account": round_off_account,
+			"cost_center": round_off_cost_center or payroll_entry.cost_center,
+			"reference_type": "Payroll Entry",
+			"reference_name": pe_name,
+		}
+		if diff > 0:
+			round_row["credit_in_account_currency"] = diff
+		else:
+			round_row["debit_in_account_currency"] = abs(diff)
+		je.append("accounts", round_row)
+
+	je.save(ignore_permissions=True)
+
+	# ERPNext's Journal Entry.validate() forcibly sets `title` from get_title()
+	# during insert (because is_new() is True), so any title we set on the doc
+	# pre-save gets overwritten. Set it post-save via db_set so it persists.
+	salary_title = _build_salary_je_title(payroll_entry)
+	if salary_title:
+		je.db_set("title", salary_title, update_modified=True)
+		je.title = salary_title
+
+	# Repoint Salary Slips' journal_entry FK to the new JE (HRMS uses this for traceability)
+	frappe.db.sql(
+		"UPDATE `tabSalary Slip` SET journal_entry = %s WHERE payroll_entry = %s AND docstatus = 1",
+		(je.name, pe_name),
+	)
+	frappe.db.commit()
+
+	if submit_now:
+		je.submit()
+
+	return je
+
+
+def _build_salary_je_title(payroll_entry):
+	"""Build the human-readable title for the Salary JE.
+
+	Format: "Salary - {Month} - {school or company}"
+	    - Month: full month name from start_date (e.g. "March")
+	    - School: PE.custom_schools if set, else PE.company
+	    - "Walnut School at <X>" is shortened to "<X>" for brevity
+	"""
+	start = payroll_entry.start_date
+	month_name = start.strftime("%B") if start else ""
+
+	school = getattr(payroll_entry, "custom_schools", None) or getattr(payroll_entry, "custom_school", None)
+	prefix = school or payroll_entry.company
+
+	# Shorten "Walnut School at Shivane" -> "Shivane" for cleaner titles
+	marker = "Walnut School at "
+	if prefix and prefix.startswith(marker):
+		prefix = prefix[len(marker):]
+
+	return f"Salary - {month_name} - {prefix}".strip(" -")
