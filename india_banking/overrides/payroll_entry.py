@@ -3,7 +3,7 @@ import json
 import frappe
 from frappe import _
 from frappe.query_builder import DocType
-from frappe.utils import get_link_to_form, nowdate
+from frappe.utils import flt, get_link_to_form, nowdate
 
 from india_banking.overrides.payment_order import get_party_summary
 from india_banking.utils import get_party_bank_account
@@ -80,6 +80,7 @@ def process_salary_payment(payroll_entry_name, mode="review"):
 
 	bank_entry.cheque_no = bank_entry.cheque_no or payroll_entry_name
 	bank_entry.cheque_date = bank_entry.cheque_date or bank_entry.posting_date or nowdate()
+	_set_debits_to_rounded_total(bank_entry, payroll_entry_name)
 	bank_entry.save()
 
 	result = {"journal_entry": bank_entry.name}
@@ -158,11 +159,58 @@ def create_payment_order_from_bank_entry(journal_entry_name, company_bank_accoun
 		)
 
 	po.company_bank_account = company_bank_account or _get_company_bank_account(bank_entry)
+	if not po.company_bank_account:
+		_log_and_throw(
+			f"Company Bank Account not derivable: {journal_entry_name}",
+			f"Journal Entry: {journal_entry_name}\nNo credit row had a Bank Account with is_company_account=1.",
+			"Journal Entry", journal_entry_name,
+			_("Could not determine the Company Bank Account from {0}. "
+			  "Set it manually or ensure the JE's bank credit row points to a Bank Account "
+			  "with <b>is_company_account = 1</b>.").format(
+				get_link_to_form("Journal Entry", journal_entry_name)),
+		)
+
 	summarise_by = frappe.db.get_single_value("India Banking Settings", "summarise_payment_based_on")
 	if summarise_by:
 		po.summarise_payment_based_on = summarise_by
 
 	_populate_summary(po, summarise_by)
+
+	# Pre-save validation: make sure summary built and every row resolves to a Mode of Transfer
+	if not po.summary:
+		_log_and_throw(
+			f"Empty Summary on PO build: {journal_entry_name}",
+			f"Journal Entry: {journal_entry_name}\nReferences: {len(po.references)}\nCompany BA: {po.company_bank_account}",
+			"Journal Entry", journal_entry_name,
+			_("Could not build the Payment Order summary for {0}. "
+			  "Check that the JE has party debit rows with valid default Bank Accounts "
+			  "and that the company bank account is set.").format(
+				get_link_to_form("Journal Entry", journal_entry_name)),
+		)
+
+	# Last-resort safety net: if any row still has no MoT (e.g. operator hasn't set
+	# a default in India Banking Settings AND the master data has gaps), force-apply
+	# the PO header default if available, else log a non-blocking warning.
+	missing_mot = [s for s in po.summary if not s.get("mode_of_transfer")]
+	if missing_mot:
+		fallback = po.default_mode_of_transfer or _get_default_mode_of_transfer()
+		if fallback:
+			for s in missing_mot:
+				s.mode_of_transfer = fallback
+			po.default_mode_of_transfer = fallback
+		else:
+			# Nothing to fall back on — log so it's traceable, but don't block save.
+			# validate_summary will surface the issue if it's actually unresolvable.
+			_log_and_msgprint(
+				f"MoT unresolved (no default set): {journal_entry_name}",
+				f"Journal Entry: {journal_entry_name}\nRows without Mode of Transfer: {len(missing_mot)}\n\n"
+				+ "\n".join(f"{s.get('party')} amount={s.get('amount')}" for s in missing_mot),
+				"Journal Entry", journal_entry_name,
+				_("{0} summary row(s) have no Mode of Transfer and no default is set "
+				  "on India Banking Settings. Set <b>Default Mode of Transfer</b> there to auto-fill.").format(
+					len(missing_mot)),
+			)
+
 	po.save(ignore_permissions=True)
 
 	frappe.msgprint(
@@ -230,17 +278,78 @@ def _validate_no_existing_payment_order(je_name):
 # --- Data helpers ---
 
 def _populate_summary(po, summarise_by):
-	"""Generate and populate Payment Order summary child table from references."""
+	"""Generate and populate Payment Order summary child table from references.
+
+	Reads the operator-configured default Mode of Transfer from India Banking Settings
+	(`default__mode_of_transfer`, double-underscore custom field) and applies it as a
+	fallback to any summary row whose bank-specific or amount-range lookup failed.
+	The PO header `default_mode_of_transfer` is also set so validate_summary's own
+	fallback works for any post-save edits.
+	"""
+	default_mot = _get_default_mode_of_transfer()
+
 	summary_items = get_party_summary(
 		references=json.dumps([ref.as_dict() for ref in po.references]),
 		company_bank_account=po.company_bank_account,
 		summarise_payment_based_on=summarise_by,
+		default_mode_of_transfer=default_mot,
 	)
-	if summary_items:
-		po.set("summary", [])
-		for item in summary_items:
-			po.append("summary", item)
-		po.total = sum(item.get("amount", 0) for item in summary_items)
+	if not summary_items:
+		return
+
+	# Force-fill any unresolved row. Prefer a non-bank-specific MoT whose amount range
+	# matches the row's amount (so a ₹3L row picks NEFT/RTGS instead of the configured
+	# IMPS default). Fall back to the configured default if nothing matches.
+	for item in summary_items:
+		if item.get("mode_of_transfer"):
+			continue
+		picked = _pick_mot_by_amount(item.get("amount") or 0) or default_mot
+		if picked:
+			item["mode_of_transfer"] = picked
+
+	if default_mot:
+		po.default_mode_of_transfer = default_mot
+
+	po.set("summary", [])
+	for item in summary_items:
+		po.append("summary", item)
+	po.total = sum(item.get("amount", 0) for item in summary_items)
+
+
+def _pick_mot_by_amount(amount):
+	"""Pick a non-bank-specific Mode of Transfer whose limit window covers `amount`.
+
+	Mirrors the cross-bank lookup in get_mode_of_transfer but is callable from the
+	fallback path for same-bank rows that lacked a bank-specific MoT.
+	"""
+	return frappe.db.get_value(
+		"Mode of Transfer",
+		{
+			"minimum_limit": ["<=", amount],
+			"maximum_limit": [">", amount],
+			"is_bank_specific": 0,
+			"disabled": 0,
+		},
+		"name",
+		order_by="priority asc",
+	)
+
+
+def _get_default_mode_of_transfer():
+	"""Read the operator-configured fallback MoT from India Banking Settings.
+
+	The custom field uses a double-underscore (`default__mode_of_transfer`) per the
+	current admin setup. We tolerate single-underscore as a safety net in case the
+	field gets renamed in future.
+	"""
+	for field in ("default__mode_of_transfer", "default_mode_of_transfer"):
+		try:
+			val = frappe.db.get_single_value("India Banking Settings", field)
+			if val:
+				return val
+		except Exception:
+			continue
+	return None
 
 
 def _get_company_bank_account(bank_entry):
@@ -249,3 +358,53 @@ def _get_company_bank_account(bank_entry):
 		if row.credit > 0 and row.account:
 			return frappe.db.get_value("Bank Account", {"account": row.account, "is_company_account": 1})
 	return None
+
+
+def _set_debits_to_rounded_total(bank_entry, payroll_entry_name):
+	"""Replace per-employee debit with Salary Slip rounded_total and rebalance bank credit.
+	"""
+	employee_rows = [r for r in bank_entry.accounts if r.party_type == "Employee" and r.party]
+	if not employee_rows:
+		return
+
+	SS = DocType("Salary Slip")
+	rows = (
+		frappe.qb.from_(SS)
+		.select(SS.employee, SS.rounded_total)
+		.where(
+			(SS.payroll_entry == payroll_entry_name)
+			& (SS.docstatus == 1)
+			& (SS.employee.isin([r.party for r in employee_rows]))
+		)
+		.run(as_dict=True)
+	)
+	rounded_map = {r.employee: flt(r.rounded_total) for r in rows}
+
+	old_debit_total = sum(flt(r.debit) for r in employee_rows)
+	new_debit_total = 0
+	for row in employee_rows:
+		amt = rounded_map.get(row.party)
+		if amt is None:
+			new_debit_total += flt(row.debit)
+			continue
+		row.debit = amt
+		row.debit_in_account_currency = amt
+		new_debit_total += amt
+
+	for row in bank_entry.accounts:
+		if not row.party and flt(row.credit) > 0:
+			row.credit = new_debit_total
+			row.credit_in_account_currency = new_debit_total
+			break
+
+	residual = flt(old_debit_total - new_debit_total, 2)
+	if residual:
+		frappe.msgprint(
+			_("Bank Entry debits adjusted to Salary Slip rounded_total. "
+			  "Residual of {0} stays open in Payroll Payable across {1} employee(s) "
+			  "(typically employer-side statutory components — clear via a separate JE).").format(
+				frappe.bold(residual), len(employee_rows)
+			),
+			indicator="orange",
+			alert=True,
+		)

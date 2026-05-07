@@ -9,6 +9,18 @@ const MODE_DESCRIPTIONS = {
 };
 
 frappe.ui.form.on("Payroll Entry", {
+	onload(frm) {
+		// recruitment app's refresh does:
+		//   frm.set_value('processing__year', new Date().getFullYear())  // -> Number
+		// but processing__year is a Data field, so DB returns a string ("2026").
+		// set_value's "2026" !== 2026 comparison flips __unsaved every refresh,
+		// causing the form to show "Not Saved" on a clean draft.
+		// Pre-coerce the loaded string to Number so the subsequent set_value is a no-op.
+		if (frm.doc.processing__year && typeof frm.doc.processing__year === "string") {
+			const n = parseInt(frm.doc.processing__year, 10);
+			if (!isNaN(n)) frm.doc.processing__year = n;
+		}
+	},
 	refresh(frm) {
 		// Add button after HRMS clears custom buttons and calls add_context_buttons
 		// Using setTimeout to ensure HRMS's async has_bank_entries callback runs first
