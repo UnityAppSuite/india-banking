@@ -24,12 +24,14 @@ def _log_and_msgprint(title, message, ref_dt=None, ref_name=None, msg=None):
 
 
 def _check_party_bank_accounts(parties, ref_dt, ref_name):
-	"""Validate parties have valid bank accounts. Throws with employee names + Error Log link if invalid.
+	"""Validate parties have valid Bank Accounts. Throws with per-employee
+	specific reason (no account / disabled / not approved / not default)
+	if any are invalid.
 
 	Args:
-		parties: list of dicts with party_type and party keys
-		ref_dt: reference doctype for Error Log linking
-		ref_name: reference name for Error Log linking
+	    parties: list of dicts with party_type and party keys
+	    ref_dt: reference doctype for Error Log linking
+	    ref_name: reference name for Error Log linking
 	"""
 	if not parties:
 		_log_and_throw(
@@ -42,25 +44,159 @@ def _check_party_bank_accounts(parties, ref_dt, ref_name):
 				get_link_to_form("Payroll Settings", "Payroll Settings")),
 		)
 
-	invalid = [p for p in parties if not get_party_bank_account(p.get("party_type"), p.get("party"))]
+	workflow_enabled = bool(frappe.db.get_single_value(
+		"India Banking Settings", "activate_workflow_on_bank_account"
+	))
+
+	invalid = []
+	for p in parties:
+		if get_party_bank_account(p.get("party_type"), p.get("party")):
+			continue
+		reason = _diagnose_party_bank_account(p.get("party_type"), p.get("party"), workflow_enabled)
+		invalid.append({**p, **reason})
+
 	if not invalid:
 		return
 
-	# Build employee name + ID display lines
-	name_map = {"Employee": "employee_name", "Supplier": "supplier_name", "Customer": "customer_name"}
-	for p in invalid:
-		p["display_name"] = frappe.db.get_value(p["party_type"], p["party"], name_map.get(p["party_type"], "name")) or p["party"]
+	# Build display lines (human-facing HTML and plain-text log)
+	error_lines = []
+	log_lines = []
+	# Group by reason category for the operator
+	categorized = {}
+	for i, p in enumerate(invalid, 1):
+		cat = p["category"]
+		categorized.setdefault(cat, []).append(p)
 
-	error_lines = [f"{i+1}. <b>{p['display_name']}</b> ({p['party']})" for i, p in enumerate(invalid)]
-	log_lines = [f"{p['party_type']}: {p['party']} - {p['display_name']}" for p in invalid]
+	for cat, items in categorized.items():
+		error_lines.append(f"<br><b>{cat}</b> ({len(items)}):")
+		for p in items:
+			ba_part = f", BA: <code>{p['ba_name']}</code>" if p.get("ba_name") else ""
+			error_lines.append(
+				f"&nbsp;&nbsp;&bull; <b>{p['display_name']}</b> "
+				f"(<code>{p['party']}</code>) — {p['detail']}{ba_part}"
+			)
+			log_lines.append(f"[{cat}] {p['party_type']}: {p['party']} - {p['display_name']} — {p['detail']}")
+
+	# Per-category fix recipes
+	fix_lines = []
+	if "No Bank Account exists" in categorized:
+		fix_lines.append("&bull; <b>No Bank Account exists</b>: create one with party_type=Employee, party=&lt;employee&gt;, is_default=1.")
+	if "Not marked as default (is_default=0)" in categorized:
+		fix_lines.append("&bull; <b>Not default</b>: open the Bank Account and tick <b>Is Default</b>.")
+	if "Disabled" in categorized:
+		fix_lines.append("&bull; <b>Disabled</b>: open the Bank Account and untick <b>Disabled</b>.")
+	if "Workflow state is not 'Approved'" in categorized:
+		fix_lines.append("&bull; <b>Not approved</b>: open the Bank Account and run it through the workflow until <b>workflow_state=Approved</b>.")
+	if "Multiple issues" in categorized:
+		fix_lines.append("&bull; <b>Multiple issues</b>: address every flag listed above on each Bank Account.")
+
+	fix_block = ("<br><br><b>How to fix:</b><br>" + "<br>".join(fix_lines)) if fix_lines else ""
 
 	_log_and_throw(
 		f"Invalid Party Bank Accounts ({len(invalid)}): {ref_name}",
-		f"{ref_dt}: {ref_name}\nTotal: {len(parties)}, Invalid: {len(invalid)}\n\n" + "\n".join(log_lines),
+		f"{ref_dt}: {ref_name}\nTotal parties: {len(parties)}, Invalid: {len(invalid)}\n\n"
+		+ "\n".join(log_lines),
 		ref_dt, ref_name,
-		_("Cannot proceed. The following {0} employees do not have a valid "
-		  "bank account (default, enabled, approved):<br><br>").format(len(invalid)) + "<br>".join(error_lines),
+		_("Cannot proceed. {0} of {1} employees do not have a usable Bank Account.<br><br>"
+		  "A usable Bank Account must satisfy ALL of:<br>"
+		  "&nbsp;&nbsp;&bull; <code>is_default = 1</code><br>"
+		  "&nbsp;&nbsp;&bull; <code>disabled = 0</code><br>"
+		  + ("&nbsp;&nbsp;&bull; <code>workflow_state = Approved</code> (because Bank Account workflow is enabled)<br>"
+		     if workflow_enabled else "")
+		  + "<br><b>Failures by category:</b>{2}{3}").format(
+			len(invalid), len(parties),
+			"".join(error_lines),
+			fix_block,
+		),
 	)
+
+
+def _diagnose_party_bank_account(party_type, party, workflow_enabled):
+	"""Look at every Bank Account belonging to this party and figure out the
+	single best reason why none qualifies as 'default, enabled, approved'.
+
+	Returns a dict: {category, detail, ba_name, display_name}
+	    category: short label suitable for grouping (e.g. 'Disabled')
+	    detail: human-readable specifics (e.g. 'BA exists but workflow_state=Pending')
+	    ba_name: the closest matching Bank Account name (if any)
+	    display_name: human-readable name of the party
+	"""
+	name_map = {"Employee": "employee_name", "Supplier": "supplier_name", "Customer": "customer_name"}
+	display_name = (
+		frappe.db.get_value(party_type, party, name_map.get(party_type, "name"))
+		or party
+	)
+
+	# All Bank Accounts for this party, regardless of state
+	all_bas = frappe.get_all(
+		"Bank Account",
+		filters={"party_type": party_type, "party": party},
+		fields=["name", "is_default", "disabled", "workflow_state", "currency"],
+	)
+
+	if not all_bas:
+		return {
+			"category": "No Bank Account exists",
+			"detail": "no Bank Account record exists for this party",
+			"ba_name": None,
+			"display_name": display_name,
+		}
+
+	# Try to find the closest-to-valid one, and report what's wrong with IT
+	# Preference: default > not-default; enabled > disabled; approved > others
+	def score(ba):
+		s = 0
+		if ba["is_default"]:
+			s += 4
+		if not ba["disabled"]:
+			s += 2
+		if not workflow_enabled or ba["workflow_state"] == "Approved":
+			s += 1
+		return s
+
+	all_bas.sort(key=score, reverse=True)
+	best = all_bas[0]
+
+	issues = []
+	if not best["is_default"]:
+		issues.append("is_default=0")
+	if best["disabled"]:
+		issues.append("disabled=1")
+	if workflow_enabled and best["workflow_state"] != "Approved":
+		issues.append(f"workflow_state='{best['workflow_state'] or '(blank)'}' (need 'Approved')")
+
+	if len(issues) == 0:
+		# Shouldn't happen — get_party_bank_account returned None but we found a valid BA?
+		# Fall through with a generic category so we don't crash.
+		return {
+			"category": "Lookup mismatch",
+			"detail": f"BA '{best['name']}' looks valid but get_party_bank_account didn't return it",
+			"ba_name": best["name"],
+			"display_name": display_name,
+		}
+	elif len(issues) == 1:
+		cat_map = {
+			"is_default=0": "Not marked as default (is_default=0)",
+			"disabled=1": "Disabled",
+		}
+		one = issues[0]
+		category = cat_map.get(
+			one,
+			"Workflow state is not 'Approved'" if one.startswith("workflow_state") else "Other",
+		)
+		return {
+			"category": category,
+			"detail": one,
+			"ba_name": best["name"],
+			"display_name": display_name,
+		}
+	else:
+		return {
+			"category": "Multiple issues",
+			"detail": ", ".join(issues),
+			"ba_name": best["name"],
+			"display_name": display_name,
+		}
 
 
 @frappe.whitelist()
@@ -178,14 +314,24 @@ def create_payment_order_from_bank_entry(journal_entry_name, company_bank_accoun
 
 	po.company_bank_account = company_bank_account or _get_company_bank_account(bank_entry)
 	if not po.company_bank_account:
+		diag = _diagnose_missing_company_bank_account(bank_entry)
 		_log_and_throw(
 			f"Company Bank Account not derivable: {journal_entry_name}",
-			f"Journal Entry: {journal_entry_name}\nNo credit row had a Bank Account with is_company_account=1.",
+			f"Journal Entry: {journal_entry_name}\n\nDiagnostic:\n{frappe.utils.strip_html(diag)}",
 			"Journal Entry", journal_entry_name,
-			_("Could not determine the Company Bank Account from {0}. "
-			  "Set it manually or ensure the JE's bank credit row points to a Bank Account "
-			  "with <b>is_company_account = 1</b>.").format(
-				get_link_to_form("Journal Entry", journal_entry_name)),
+			_("Could not resolve the Company Bank Account for {0}.<br><br>"
+			  "We look up a <b>Bank Account</b> doc where:<br>"
+			  "&nbsp;&nbsp;1. Its <code>account</code> field equals the JE credit row's account, OR<br>"
+			  "&nbsp;&nbsp;2. Its <code>bank_account_no</code> equals the COA Account's "
+			  "<code>account_number</code> (for the same Company)<br>"
+			  "AND <code>is_company_account = 1</code> AND not disabled.<br><br>"
+			  "<b>Diagnostic for this JE:</b><br>{1}<br><br>"
+			  "Most common cause: a Bank Account exists with the correct "
+			  "<code>bank_account_no</code> but its <code>account</code> link points to a "
+			  "<b>parent/group COA account</b> instead of the specific leaf. Open that Bank "
+			  "Account and set its <b>Account</b> field to the JE row's specific account.").format(
+				get_link_to_form("Journal Entry", journal_entry_name), diag,
+			),
 		)
 
 	summarise_by = frappe.db.get_single_value("India Banking Settings", "summarise_payment_based_on")
@@ -418,11 +564,127 @@ def _get_default_mode_of_transfer():
 
 
 def _get_company_bank_account(bank_entry):
-	"""Derive company bank account from the JE's credit (bank) account row."""
+	"""Derive company Bank Account from the JE's credit (bank) account row.
+
+	Two strategies in order, so a Bank Account whose `account` link points to a
+	parent/group COA account (instead of the specific leaf) still resolves:
+	  1. Direct: Bank Account.account == JE row's account, is_company_account=1
+	  2. Fallback: match COA Account.account_number to Bank Account.bank_account_no
+	     scoped to the same Company.
+	"""
 	for row in bank_entry.accounts:
-		if row.credit > 0 and row.account:
-			return frappe.db.get_value("Bank Account", {"account": row.account, "is_company_account": 1})
+		if not (row.credit > 0 and row.account):
+			continue
+
+		# 1. Direct match — Bank Account.account points to the JE's credit account
+		ba = frappe.db.get_value(
+			"Bank Account",
+			{"account": row.account, "is_company_account": 1},
+			"name",
+		)
+		if ba:
+			return ba
+
+		# 2. Fallback — match COA Account.account_number to Bank Account.bank_account_no
+		coa_acc_no = frappe.db.get_value("Account", row.account, "account_number")
+		if coa_acc_no:
+			ba = frappe.db.get_value(
+				"Bank Account",
+				{
+					"bank_account_no": coa_acc_no,
+					"is_company_account": 1,
+					"company": bank_entry.company,
+				},
+				"name",
+			)
+			if ba:
+				return ba
+
 	return None
+
+
+def _diagnose_missing_company_bank_account(bank_entry):
+	"""Build a diagnostic showing why _get_company_bank_account couldn't resolve.
+
+	Returns a short HTML string describing each credit row's account, what would
+	have matched, and what's misconfigured. Used in the user-facing error so the
+	operator can fix the data without digging through logs.
+	"""
+	lines = []
+	for row in bank_entry.accounts:
+		if not (row.credit > 0 and row.account):
+			continue
+
+		coa = frappe.db.get_value(
+			"Account", row.account,
+			["account_number", "account_type", "is_group", "company"],
+			as_dict=True,
+		) or {}
+
+		# Show any Bank Accounts whose `account` field links to this row's account
+		direct_matches = frappe.get_all(
+			"Bank Account",
+			filters={"account": row.account},
+			fields=["name", "is_company_account", "disabled", "bank_account_no"],
+		)
+		# Show any Bank Accounts whose bank_account_no equals the COA account_number
+		num_matches = []
+		if coa.get("account_number"):
+			num_matches = frappe.get_all(
+				"Bank Account",
+				filters={
+					"bank_account_no": coa["account_number"],
+					"company": bank_entry.company,
+				},
+				fields=["name", "account", "is_company_account", "disabled"],
+			)
+
+		segment = []
+		segment.append(f"<b>JE credit row account</b>: <code>{row.account}</code>")
+		segment.append(
+			f"&nbsp;&nbsp;COA: account_number=<code>{coa.get('account_number') or '(none)'}</code>, "
+			f"account_type=<code>{coa.get('account_type') or '(none)'}</code>, "
+			f"is_group=<code>{coa.get('is_group')}</code>"
+		)
+
+		if direct_matches:
+			for d in direct_matches:
+				flag = "" if d["is_company_account"] and not d["disabled"] else " &lt;-- is_company_account=0 or disabled"
+				segment.append(
+					f"&nbsp;&nbsp;Direct match: {d['name']} "
+					f"(is_company_account={d['is_company_account']}, disabled={d['disabled']}){flag}"
+				)
+		else:
+			segment.append("&nbsp;&nbsp;Direct match (Bank Account.account = this row): <b>none</b>")
+
+		if num_matches:
+			for n in num_matches:
+				flag = ""
+				if not n["is_company_account"]:
+					flag = " &lt;-- is_company_account=0 (set this to 1)"
+				elif n["disabled"]:
+					flag = " &lt;-- disabled"
+				else:
+					flag = (
+						f" &lt;-- this Bank Account exists with the right bank_account_no but "
+						f"its <code>account</code> field points to <code>{n['account']}</code> "
+						f"instead of <code>{row.account}</code>. Fix: open Bank Account "
+						f"<b>{n['name']}</b> and set its <b>Account</b> field to "
+						f"<code>{row.account}</code>."
+					)
+				segment.append(
+					f"&nbsp;&nbsp;By account_number={coa.get('account_number')}: {n['name']} "
+					f"(is_company_account={n['is_company_account']}, account={n['account']}){flag}"
+				)
+		elif coa.get("account_number"):
+			segment.append(
+				f"&nbsp;&nbsp;By account_number={coa['account_number']}: <b>no Bank Account exists</b> "
+				f"with this bank_account_no for company <code>{bank_entry.company}</code>."
+			)
+
+		lines.append("<br>".join(segment))
+
+	return "<br><br>".join(lines) if lines else "(no credit rows with an account on this JE)"
 
 
 def _set_debits_to_rounded_total(bank_entry, payroll_entry_name):
